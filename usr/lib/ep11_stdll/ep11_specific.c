@@ -16,6 +16,9 @@
 #include <regex.h>
 #include <dirent.h>
 #include <libgen.h>
+#ifndef NO_PKEY
+#include <asm/pkey.h>
+#endif
 
 #define OCK_NO_EP11_DEFINES
 #include "pkcs11types.h"
@@ -1296,6 +1299,122 @@ CK_RV ep11tok_pkey_add_protkey_attr_to_tmpl(TEMPLATE *tmpl)
 
 done:
     return ret;
+}
+
+static CK_RV ep11tok_pkey_convert_key(STDLL_TokData_t *tokdata, SESSION *session,
+                                     OBJECT *key_obj, CK_BBOOL xts_mode,
+                                     CK_BYTE *protkey, CK_ULONG *protkey_len)
+{
+    ep11_private_data_t *ep11_data = tokdata->private_data;
+    CK_ATTRIBUTE *skey_reenc_attr = NULL;
+    CK_ATTRIBUTE *skey_attr = NULL;
+    CK_ATTRIBUTE *pkey_attr = NULL;
+    CK_RV rc, ret1;
+
+    if (*protkey_len < MAXPROTKEYSIZE) {
+        rc = CKR_BUFFER_TOO_SMALL;
+        goto done;
+    }
+
+    /* Try to obtain a write lock on the key_obj */
+    ret1 = object_unlock(key_obj);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("object_unlock failed, rc=0x%lx\n", ret1);
+        rc = CKR_FUNCTION_FAILED;
+        goto done;
+    }
+
+    ret1 = object_lock(key_obj, WRITE_LOCK);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("Could not obtain write lock.\n");
+        rc = CKR_FUNCTION_FAILED;
+        goto done;
+    }
+
+    /* The key_obj could be modified between unlock and lock. Therefore get
+     * the attribute when we have the write lock here.
+     */
+    if (template_attribute_get_non_empty(key_obj->template,
+                                         CKA_IBM_OPAQUE, &skey_attr) != CKR_OK) {
+        TRACE_ERROR("This key has no blob: should not occur!\n");
+        rc = CKR_FUNCTION_FAILED;
+        goto done;
+    }
+
+    /* Convert secure key to protected key. */
+    if (ep11_data->mk_change_active) {
+        /* Try to get CKA_IBM_OPAQUE_REENC, ignore if it fails */
+        template_attribute_get_non_empty(key_obj->template,
+                                         CKA_IBM_OPAQUE_REENC, &skey_reenc_attr);
+    }
+    ret1 = ep11tok_pkey_skey2pkey(tokdata, session, skey_attr, skey_reenc_attr,
+                                  &pkey_attr, xts_mode);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("protkey creation failed, rc=0x%lx\n", ret1);
+        rc = CKR_FUNCTION_FAILED;
+        goto unlock;
+    }
+
+    /* Save new protkey attr in key_obj. This happens only in memory,
+     * works also for r/o sessions.
+     */
+    ret1 = template_update_attribute(key_obj->template, pkey_attr);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("template_update_attribute failed, rc=0x%lx\n", ret1);
+        goto unlock;
+    }
+
+    /* If we have a r/w session, also save obj to disk. */
+    if (ep11tok_pkey_session_ok_for_obj(session, key_obj)) {
+        if (object_is_token_object(key_obj)) {
+            ret1 = object_mgr_save_token_object(tokdata, key_obj);
+            if (ret1 != CKR_OK) {
+                TRACE_ERROR(
+                        "Could not save token obj to repository, rc=0x%lx.\n",
+                        ret1);
+                goto unlock;
+            }
+        }
+    }
+
+    /* Update wkvp in EP11 private data. */
+    if (pthread_mutex_lock(&ep11_data->pkey_mutex)) {
+        TRACE_ERROR("%s Failed to lock pkey lock\n", __func__);
+        rc = CKR_CANT_LOCK;
+        goto unlock;
+    }
+    memcpy(&ep11_data->pkey_mk_vp,
+            (CK_BYTE *) pkey_attr->pValue
+                    + pkey_attr->ulValueLen - PKEY_MK_VP_LENGTH,
+            PKEY_MK_VP_LENGTH);
+    if (pthread_mutex_unlock(&ep11_data->pkey_mutex)) {
+        TRACE_ERROR("%s Failed to lock pkey lock\n", __func__);
+    }
+
+    /* Pass back new protkey. Need to do this before unlocking the obj. */
+    memcpy(protkey, pkey_attr->pValue, pkey_attr->ulValueLen);
+    *protkey_len = pkey_attr->ulValueLen;
+
+unlock:
+    ret1 = object_unlock(key_obj);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("object_unlock failed, rc=0x%lx\n", ret1);
+        rc = CKR_FUNCTION_FAILED;
+        goto done;
+    }
+
+    ret1 = object_lock(key_obj, READ_LOCK);
+    if (ret1 != CKR_OK) {
+        TRACE_ERROR("object_lock for READ failed, rc=0x%lx\n", ret1);
+        rc = CKR_FUNCTION_FAILED;
+        goto done;
+    }
+
+    rc = CKR_OK;
+
+done:
+
+    return rc;
 }
 #endif /* NO_PKEY */
 
