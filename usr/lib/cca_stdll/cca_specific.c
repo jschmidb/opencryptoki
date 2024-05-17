@@ -5874,7 +5874,8 @@ CK_RV token_specific_aes_ecb(STDLL_TokData_t * tokdata,
     switch (rc) {
     case CKR_OK:
         rc = pkey_aes_ecb(tokdata, session, key, in_data, in_data_len,
-                          out_data, out_data_len, encrypt);
+                          out_data, out_data_len, encrypt,
+                          ccatok_pkey_convert_key);
         goto done;
     case CKR_FUNCTION_NOT_SUPPORTED:
         /* fallback */
@@ -6014,7 +6015,8 @@ CK_RV token_specific_aes_cbc(STDLL_TokData_t * tokdata,
     switch (rc) {
     case CKR_OK:
         rc = pkey_aes_cbc(tokdata, session, key, init_v, in_data, in_data_len,
-                          out_data, out_data_len, encrypt);
+                          out_data, out_data_len, encrypt,
+                          ccatok_pkey_convert_key);
         goto done;
     case CKR_FUNCTION_NOT_SUPPORTED:
         /* fallback */
