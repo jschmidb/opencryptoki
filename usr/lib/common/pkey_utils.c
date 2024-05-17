@@ -891,6 +891,11 @@ struct aes_xts_param {
     uint8_t param_pcc[sizeof(struct cpacf_pcc_xts_aes_256_param)];
     unsigned int fc;
     unsigned int keylen;
+    // Below: convert_key routine and parms needed by convert_key
+    convert_key_t convert_key;
+    STDLL_TokData_t *tokdata;
+    SESSION *session;
+    OBJECT *key_obj;
 };
 
 static CK_RV pkey_aes_xts_iv_from_tweak(CK_BYTE *tweak, CK_BYTE* iv,
@@ -918,19 +923,45 @@ static CK_RV pkey_aes_xts_cipher_blocks(CK_BYTE *in, CK_BYTE *out, CK_ULONG len,
                                         CK_BYTE *iv, void *cb_data)
 {
     struct aes_xts_param *param = cb_data;
-    int bytes_processed;
+    convert_key_t convert_key = param->convert_key;
+    unsigned int bytes_processed = 0;
+    int num_tries = 0;
+    CK_BYTE protkey[MAXPROTKEYSIZE];
+    CK_ULONG protkey_len = sizeof(protkey);
+    CK_BYTE *in_pos = in;
+    CK_BYTE *out_pos = out;
+    CK_ULONG len2 = len;
+    CK_RV ret;
 
     int offset = AES_XTS_KM_XTSPARAM(param->keylen * 8);
     memcpy(param->param_km + offset, iv, AES_BLOCK_SIZE);
 
-    bytes_processed = s390_km(param->fc, param->param_km, out, in, len);
-    if (bytes_processed < len) {
+    while (len2 > 0 && num_tries < PKEY_CONVERT_KEY_RETRIES) {
+        bytes_processed = s390_km(param->fc, param->param_km, out_pos, in_pos, len2);
+        if (bytes_processed < len2) {
+            ret = convert_key(param->tokdata, param->session, param->key_obj,
+                              CK_TRUE, protkey, &protkey_len);
+            if (ret != CKR_OK)
+                goto done;
+            memcpy(param->param_km, protkey, protkey_len);
+        }
+        in_pos += bytes_processed;
+        out_pos += bytes_processed;
+        len2 -= bytes_processed;
+        num_tries++;
+    }
+
+    if (len2 > 0) {
         TRACE_ERROR("s390_km function failed\n");
-        return CKR_FUNCTION_FAILED;
+        ret = CKR_FUNCTION_FAILED;
+        goto done;
     }
 
     memcpy(iv, param->param_km + offset, AES_BLOCK_SIZE);
-    return CKR_OK;
+    ret = CKR_OK;
+
+done:
+    return ret;
 }
 
 /**
@@ -940,16 +971,14 @@ CK_RV pkey_aes_xts(STDLL_TokData_t *tokdata, SESSION *session,
                    OBJECT *key_obj, CK_BYTE *tweak,
                    CK_BYTE *in_data, CK_ULONG in_data_len, CK_BYTE *out_data,
                    CK_ULONG_PTR p_output_data_len, CK_BYTE encrypt,
-                   CK_BBOOL initial, CK_BBOOL final, CK_BYTE *iv)
+                   CK_BBOOL initial, CK_BBOOL final, CK_BYTE *iv,
+                   convert_key_t convert_key)
 {
     CK_RV ret = CKR_OK;
     CK_ATTRIBUTE *pkey_attr = NULL;
     struct aes_xts_param param = {0};
     CK_ULONG keylen = 0;
     unsigned long fc;
-
-    UNUSED(tokdata);
-    UNUSED(session);
 
     /* Check parms */
     if (in_data_len == 0) {
@@ -996,12 +1025,16 @@ CK_RV pkey_aes_xts(STDLL_TokData_t *tokdata, SESSION *session,
            pkey_attr->ulValueLen / 2);
     param.fc = fc;
     param.keylen = keylen;
+    param.convert_key = convert_key;
+    param.tokdata = tokdata;
+    param.session = session;
+    param.key_obj = key_obj;
 
     ret = aes_xts_cipher(in_data, in_data_len, out_data, p_output_data_len,
-                        tweak, encrypt, initial, final, iv,
-                        pkey_aes_xts_iv_from_tweak,
-                        pkey_aes_xts_cipher_blocks,
-                        &param);
+                         tweak, encrypt, initial, final, iv,
+                         pkey_aes_xts_iv_from_tweak,
+                         pkey_aes_xts_cipher_blocks,
+                         &param);
 
     return ret;
 }
